@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { MangaItem, OCRCache, SpeechBubble } from '../types';
-import { analyzeMangaPages, blobUrlToBase64 } from '../utils/ocr';
+import { analyzeMangaPages, blobUrlToBase64, performBatchedOCR } from '../utils/ocr';
 
 interface ReaderProps {
   manga: MangaItem;
@@ -16,8 +16,12 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
   
   // Analysis State
   const [analysisCache, setAnalysisCache] = useState<OCRCache>({});
+  const [ocrTextCache, setOcrTextCache] = useState<Record<number, string>>({});
+  const [debugError, setDebugError] = useState<string | null>(null);
   const [isAnalysisEnabled, setIsAnalysisEnabled] = useState(false);
   const processingQueue = useRef<Set<number>>(new Set());
+  const pendingOCRBatches = useRef<Set<number>>(new Set());
+  const preloadedImages = useRef<Record<number, HTMLImageElement>>({});
   
   // TTS State
   const [ttsEnabled, setTtsEnabled] = useState(false);
@@ -27,101 +31,229 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
 
   // --- Analysis Logic (Batch Queue) ---
 
-  const processBatch = useCallback(async (batchIndex: number) => {
-    // 1. Check if batch is already processing
+  // Preload images for a batch into browser memory only — DO NOT call Gemini here
+  const preloadBatch = useCallback(async (batchIndex: number) => {
     if (processingQueue.current.has(batchIndex)) return;
 
-    // 2. Check if all pages in this batch are already complete
     const startPage = batchIndex * BATCH_SIZE;
     const endPage = Math.min(startPage + BATCH_SIZE, manga.pages.length);
-    
-    let allLoaded = true;
-    for (let i = startPage; i < endPage; i++) {
-        if (analysisCache[i]?.status !== 'complete') {
-            allLoaded = false;
-            break;
-        }
-    }
-    if (allLoaded) return;
 
-    // 3. Lock batch
+    // If all pages already have preloaded images, skip
+    let allPreloadedOrDone = true;
+    for (let i = startPage; i < endPage; i++) {
+      if (!preloadedImages.current[i]) {
+        allPreloadedOrDone = false;
+        break;
+      }
+    }
+    if (allPreloadedOrDone) return;
+
     processingQueue.current.add(batchIndex);
 
-    // 4. Set Loading State for all pages in batch
+    // Mark entries as preloading so UI can reflect intent (but not call API)
     setAnalysisCache(prev => {
-        const nextState = { ...prev };
-        for (let i = startPage; i < endPage; i++) {
-            // Only overwrite if not already done
-            if (nextState[i]?.status !== 'complete') {
-                nextState[i] = { bubbles: [], status: 'loading' };
-            }
+      const nextState = { ...prev };
+      for (let i = startPage; i < endPage; i++) {
+        if (nextState[i]?.status !== 'complete') {
+          nextState[i] = { bubbles: [], status: 'preloaded' };
         }
-        return nextState;
+      }
+      return nextState;
     });
 
     try {
-      // 5. Prepare images
-      const imagePromises = [];
+      // Create Image objects and cache them in memory. This is the ONLY background work allowed.
+      const promises: Promise<void>[] = [];
       for (let i = startPage; i < endPage; i++) {
-          imagePromises.push(blobUrlToBase64(manga.pages[i]));
+        if (!manga.pages[i]) continue;
+        if (preloadedImages.current[i]) continue;
+
+        promises.push(new Promise<void>((resolve) => {
+          const img = new Image();
+          img.crossOrigin = 'anonymous';
+          img.onload = () => {
+            preloadedImages.current[i] = img;
+            resolve();
+          };
+          img.onerror = () => { resolve(); };
+          img.src = manga.pages[i];
+        }));
+      }
+
+      await Promise.all(promises);
+    } catch (err) {
+      console.warn('Preload batch failed', err);
+    } finally {
+      processingQueue.current.delete(batchIndex);
+    }
+  }, [manga.pages]);
+
+  // Explicit analysis function that MUST be triggered by an explicit user action.
+  const analyzeBatch = useCallback(async (batchIndex: number) => {
+    if (processingQueue.current.has(batchIndex)) return;
+
+    const startPage = batchIndex * BATCH_SIZE;
+    const endPage = Math.min(startPage + BATCH_SIZE, manga.pages.length);
+
+    processingQueue.current.add(batchIndex);
+
+    // Set loading state
+    setAnalysisCache(prev => {
+      const nextState = { ...prev };
+      for (let i = startPage; i < endPage; i++) {
+        if (nextState[i]?.status !== 'complete') nextState[i] = { bubbles: [], status: 'loading' };
+      }
+      return nextState;
+    });
+
+    try {
+      const imagePromises: Promise<string>[] = [];
+      for (let i = startPage; i < endPage; i++) {
+        imagePromises.push(blobUrlToBase64(manga.pages[i]));
       }
       const base64Images = await Promise.all(imagePromises);
 
-      // 6. Call API (Batch)
+      // THIS is the only place that calls the Gemini API (analyzeMangaPages)
       const batchResults = await analyzeMangaPages(base64Images);
-      
-      // 7. Update Cache
+
       setAnalysisCache(prev => {
         const nextState = { ...prev };
         batchResults.forEach((bubbles, relativeIndex) => {
-            const absoluteIndex = startPage + relativeIndex;
-            
-            // Sort bubbles
-            bubbles.sort((a, b) => {
-                const yDiff = a.box_2d[0] - b.box_2d[0];
-                if (Math.abs(yDiff) > 50) return yDiff;
-                return b.box_2d[1] - a.box_2d[1];
-            });
-
-            nextState[absoluteIndex] = { bubbles, status: 'complete' };
+          const absoluteIndex = startPage + relativeIndex;
+          bubbles.sort((a, b) => {
+            const yDiff = a.box_2d[0] - b.box_2d[0];
+            if (Math.abs(yDiff) > 50) return yDiff;
+            return b.box_2d[1] - a.box_2d[1];
+          });
+          nextState[absoluteIndex] = { bubbles, status: 'complete' };
         });
         return nextState;
       });
     } catch (err) {
-      console.error("Batch analysis failed", err);
+      console.error('Batch analysis failed', err);
       setAnalysisCache(prev => {
         const nextState = { ...prev };
         for (let i = startPage; i < endPage; i++) {
-             nextState[i] = { bubbles: [], status: 'error' };
+          nextState[i] = { bubbles: [], status: 'error' };
         }
         return nextState;
       });
     } finally {
       processingQueue.current.delete(batchIndex);
     }
-  }, [manga.pages, analysisCache]);
+  }, [manga.pages]);
 
   // Trigger Strategy
   useEffect(() => {
-    if (!isAnalysisEnabled) return;
-
-    // Calculate which batch the current page belongs to
+    // Always preload current and next batch images into memory — but do NOT call the API.
     const currentBatch = Math.floor(currentIndex / BATCH_SIZE);
-    
-    // Process current batch
-    processBatch(currentBatch);
+    preloadBatch(currentBatch);
 
-    // Pre-fetch next batch
     const nextBatch = currentBatch + 1;
     if (nextBatch * BATCH_SIZE < manga.pages.length) {
       const timer = setTimeout(() => {
-        processBatch(nextBatch);
+        preloadBatch(nextBatch);
       }, 500);
       return () => clearTimeout(timer);
     }
-  }, [currentIndex, isAnalysisEnabled, processBatch, manga.pages.length]);
+  }, [currentIndex, preloadBatch, manga.pages.length]);
+
+  // --- Background Preloading of next pages (n+1, n+2, n+3) ---
+  useEffect(() => {
+    const preload = (idx: number) => {
+      if (!manga.pages[idx]) return;
+      if (preloadedImages.current[idx]) return;
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = manga.pages[idx];
+      img.onload = () => { preloadedImages.current[idx] = img; };
+      img.onerror = () => { /* ignore */ };
+    };
+
+    for (let i = 1; i <= 3; i++) {
+      preload(currentIndex + i);
+    }
+  }, [currentIndex, manga.pages]);
+
+  // --- Batched OCR (per-page text) ---
+  const requestOCRForPage = useCallback(async (index: number) => {
+    try {
+      setDebugError(null); // clear previous errors
+      
+      // Check if all pages in this batch are already cached
+      const batchStart = index;
+      const batchEnd = Math.min(batchStart + 3, manga.pages.length);
+      let allCached = true;
+      for (let i = batchStart; i < batchEnd; i++) {
+        if (!ocrTextCache[i]) {
+          allCached = false;
+          break;
+        }
+      }
+      if (allCached) {
+        console.log(`[OCR] Pages ${batchStart}-${batchEnd - 1} already cached`);
+        return;
+      }
+
+      // ===== AUDIO UNLOCK TRICK FOR MOBILE =====
+      // Immediately after user interaction (button click), unlock the speech engine
+      // with a silent utterance. This bypasses mobile autoplay restrictions.
+      const unlockMsg = new SpeechSynthesisUtterance('');
+      unlockMsg.volume = 0;
+      window.speechSynthesis.speak(unlockMsg);
+      // ==========================================
+
+      // Prevent duplicate batch requests
+      if (pendingOCRBatches.current.has(batchStart)) {
+        console.log(`[OCR] Batch starting at page ${batchStart} already pending`);
+        return;
+      }
+      pendingOCRBatches.current.add(batchStart);
+      console.log(`[OCR] Starting batch from page ${batchStart}`);
+
+      // Grab next 3 pages starting from currentIndex
+      const urls = manga.pages.slice(batchStart, batchStart + 3);
+      
+      if (urls.length === 0) {
+        console.log(`[OCR] No pages to process`);
+        return;
+      }
+
+      console.log(`[OCR] Requesting ${urls.length} pages (indices ${batchStart}-${batchStart + urls.length - 1})`);
+      const texts = await performBatchedOCR(urls);
+      
+      // Map texts to absolute page indexes
+      setOcrTextCache(prev => {
+        const next = { ...prev };
+        texts.forEach((t, i) => {
+          const absoluteIndex = batchStart + i;
+          next[absoluteIndex] = t || '';
+          console.log(`[OCR] Cached page ${absoluteIndex}`);
+        });
+        return next;
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error('OCR request failed', err);
+      setDebugError(errorMsg);
+    } finally {
+      pendingOCRBatches.current.delete(index);
+    }
+  }, [manga.pages]);
 
   // --- TTS Logic ---
+
+  // Audio unlock effect: triggered when TTS is enabled
+  useEffect(() => {
+    if (!ttsEnabled) return;
+
+    // Unlock speech engine with silent utterance
+    const unlockMsg = new SpeechSynthesisUtterance('');
+    unlockMsg.volume = 0;
+    window.speechSynthesis.speak(unlockMsg);
+    
+    console.log('[TTS] Audio unlocked on enable');
+  }, [ttsEnabled]);
 
   // Separate effect to handle Page Turn or Disable
   useEffect(() => {
@@ -133,55 +265,89 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
   }, [ttsEnabled, isAnalysisEnabled]);
 
   // Effect to queue speech when data becomes available
-  useEffect(() => {
+  const speakCurrentPage = useCallback(async () => {
     if (!ttsEnabled || !isAnalysisEnabled) return;
 
-    const currentPageData = analysisCache[currentIndex];
+    const pageIndex = currentIndex;
+    try {
+      const cachedText = ocrTextCache[pageIndex];
+      if (cachedText && cachedText.trim().length > 0) {
+        if (lastSpokenPageIndexRef.current === pageIndex && synth.current.speaking) return;
+        if (lastSpokenPageIndexRef.current !== pageIndex) {
+          synth.current.cancel();
+          setActiveBubbleIndex(null);
+        }
+        lastSpokenPageIndexRef.current = pageIndex;
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(cachedText);
 
-    // Check if we are already speaking this page content
-    if (lastSpokenPageIndexRef.current === currentIndex && synth.current.speaking) {
-        return; 
+        let voices = window.speechSynthesis.getVoices();
+        if (voices.length === 0) {
+          await new Promise(resolve => {
+            const handleVoices = () => { voices = window.speechSynthesis.getVoices(); window.speechSynthesis.removeEventListener('voiceschanged', handleVoices); resolve(null); };
+            window.speechSynthesis.addEventListener('voiceschanged', handleVoices);
+            setTimeout(resolve, 1000);
+          });
+        }
+        const voice = voices.find(v => v.name.includes('Google US English')) || voices.find(v => v.lang.startsWith('en'));
+        if (voice) utterance.voice = voice;
+        utterance.rate = 1.0; utterance.pitch = 1.0; utterance.volume = 1;
+        utterance.onstart = () => setActiveBubbleIndex(null);
+        utterance.onend = () => setActiveBubbleIndex(null);
+        utterance.onerror = (e) => setDebugError(`TTS Error: ${e instanceof Error ? e.message : String(e)}`);
+        synth.current.speak(utterance);
+        return;
+      }
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error('[TTS] OCR text error:', errorMsg);
+      setDebugError(`TTS OCR text error: ${errorMsg}`);
+      return;
     }
 
-    // Cancel previous page speech if we moved
-    if (lastSpokenPageIndexRef.current !== currentIndex) {
+    // Fallback to bubble-based TTS
+    try {
+      const currentPageData = analysisCache[pageIndex];
+      if (!currentPageData || currentPageData.status !== 'complete') return;
+      if (currentPageData.bubbles.length === 0) return;
+      if (lastSpokenPageIndexRef.current === pageIndex && synth.current.speaking) return;
+      if (lastSpokenPageIndexRef.current !== pageIndex) {
         synth.current.cancel();
         setActiveBubbleIndex(null);
-    }
+      }
+      lastSpokenPageIndexRef.current = pageIndex;
+      window.speechSynthesis.cancel();
 
-    if (currentPageData?.status === 'complete' && currentPageData.bubbles.length > 0) {
-        lastSpokenPageIndexRef.current = currentIndex;
-        
-        // Queue bubbles one by one
-        currentPageData.bubbles.forEach((bubble, i) => {
-            const utterance = new SpeechSynthesisUtterance(bubble.text);
-            const voices = synth.current.getVoices();
-            const voice = voices.find(v => v.name.includes('Google US English')) || 
-                          voices.find(v => v.lang.startsWith('en'));
-            if (voice) utterance.voice = voice;
-            utterance.rate = 1.0;
-
-            utterance.onstart = () => {
-                setActiveBubbleIndex(i);
-            };
-
-            utterance.onend = () => {
-                // If this was the last bubble, clear highlight
-                if (i === currentPageData.bubbles.length - 1) {
-                    setActiveBubbleIndex(null);
-                }
-            };
-            
-            utterance.onerror = () => {
-                if (i === currentPageData.bubbles.length - 1) {
-                    setActiveBubbleIndex(null);
-                }
-            };
-
-            synth.current.speak(utterance);
+      let voices = window.speechSynthesis.getVoices();
+      if (voices.length === 0) {
+        await new Promise(resolve => {
+          const handleVoices = () => { voices = window.speechSynthesis.getVoices(); window.speechSynthesis.removeEventListener('voiceschanged', handleVoices); resolve(null); };
+          window.speechSynthesis.addEventListener('voiceschanged', handleVoices);
+          setTimeout(resolve, 1000);
         });
+      }
+
+      currentPageData.bubbles.forEach((bubble, i) => {
+        const utterance = new SpeechSynthesisUtterance(bubble.text);
+        const voice = voices.find(v => v.name.includes('Google US English')) || voices.find(v => v.lang.startsWith('en'));
+        if (voice) utterance.voice = voice;
+        utterance.rate = 1.0; utterance.pitch = 1.0; utterance.volume = 1;
+        utterance.onstart = () => setActiveBubbleIndex(i);
+        utterance.onend = () => { if (i === currentPageData.bubbles.length - 1) setActiveBubbleIndex(null); };
+        utterance.onerror = () => { if (i === currentPageData.bubbles.length - 1) setActiveBubbleIndex(null); };
+        synth.current.speak(utterance);
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      console.error('[TTS] Bubbles error:', errorMsg);
+      setDebugError(`TTS Bubbles error: ${errorMsg}`);
     }
-  }, [currentIndex, ttsEnabled, isAnalysisEnabled, analysisCache]);
+  }, [currentIndex, ttsEnabled, isAnalysisEnabled, analysisCache, ocrTextCache]);
+
+  useEffect(() => {
+    // call speakCurrentPage whenever dependencies change
+    speakCurrentPage();
+  }, [speakCurrentPage]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -230,6 +396,16 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
 
   return (
     <div className="relative h-screen w-full flex items-center justify-center bg-black overflow-hidden select-none font-sans">
+      
+      {/* Debug Error Box */}
+      {debugError && (
+        <div className="absolute top-0 left-0 right-0 z-[999] bg-red-600 text-white p-4 text-sm font-bold border-b-2 border-red-800 max-h-32 overflow-auto break-words">
+          <div className="flex justify-between items-start">
+            <span>ERROR: {debugError}</span>
+            <button onClick={() => setDebugError(null)} className="ml-4 font-bold text-lg">×</button>
+          </div>
+        </div>
+      )}
       
       {/* Container for Image + Overlays */}
       <div 
@@ -327,13 +503,38 @@ export const Reader: React.FC<ReaderProps> = ({ manga, onClose }) => {
           {/* Central Action: Analysis Toggle */}
           <div className="relative group">
              <button 
-                 onClick={() => setIsAnalysisEnabled(!isAnalysisEnabled)}
-                 className={`size-16 flex items-center justify-center rounded-lg transition-all border ${isAnalysisEnabled ? 'bg-primary text-white border-primary shadow-[0_0_20px_rgba(75,43,238,0.5)]' : 'bg-white/5 text-white/80 border-white/5 hover:bg-white/10'}`}
-                 title="Toggle AI Analysis"
+               onClick={() => {
+                 const batch = Math.floor(currentIndex / BATCH_SIZE);
+                 setIsAnalysisEnabled(true);
+                 analyzeBatch(batch);
+               }}
+               className={`size-16 flex items-center justify-center rounded-lg transition-all border ${isAnalysisEnabled ? 'bg-primary text-white border-primary shadow-[0_0_20px_rgba(75,43,238,0.5)]' : 'bg-white/5 text-white/80 border-white/5 hover:bg-white/10'}`}
+               title="Analyze/Scan current batch"
              >
                  <span className="material-symbols-outlined text-3xl">psychology</span>
              </button>
           </div>
+
+          {/* OCR Extract Button - Show if current page not cached */}
+          {!ocrTextCache[currentIndex] && (
+            <button
+              onClick={() => requestOCRForPage(currentIndex)}
+              className="size-14 flex items-center justify-center rounded-lg bg-blue-600/30 hover:bg-blue-600/50 border border-blue-500 transition-colors shadow-lg"
+              title="Extract text from current page and next 2 pages"
+            >
+              <span className="material-symbols-outlined text-blue-300 text-2xl">text_snippet</span>
+            </button>
+          )}
+          {ocrTextCache[currentIndex] && (
+            <button
+              onClick={() => requestOCRForPage(currentIndex)}
+              className="size-14 flex items-center justify-center rounded-lg hover:bg-white/10 transition-colors opacity-50"
+              title="Extract text (current page already cached)"
+              disabled
+            >
+              <span className="material-symbols-outlined text-white text-2xl">check_circle</span>
+            </button>
+          )}
 
           <button 
             onClick={handleNext}
